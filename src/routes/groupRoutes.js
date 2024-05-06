@@ -222,12 +222,11 @@ router.post('/create-group', async (req, res) => {
             console.log('Group created successfully, ID:', this.lastID);
             const groupId = this.lastID;
 
-            // Assuming matches are fetched correctly
             matches.forEach(match => {
                 console.log(`Inserting match: ${match.id}`);
                 const formattedDate = formatMatchDate(match.utcDate);
-                db.run('INSERT INTO matches (group_id, match_id, home_team, away_team, match_date) VALUES (?, ?, ?, ?, ?)', 
-                    [groupId, match.id, match.homeTeam.name, match.awayTeam.name, formattedDate], 
+                db.run('INSERT INTO matches (group_id, match_id, home_team, away_team, match_date, status, winner, home_score, away_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', 
+                    [groupId, match.id, match.homeTeam.name, match.awayTeam.name, formattedDate, match.status, match.score.winner, match.score.fullTime.home, match.score.fullTime.away], 
                     err => {
                         if (err) console.error('Error adding match to group:', err);
                         else console.log('Match added successfully');
@@ -310,7 +309,7 @@ router.get('/group/:groupId', (req, res) => {
             return res.status(404).send('Group not found');
         }
 
-        db.all('SELECT * FROM matches WHERE group_id = ?', groupId, (err, matches) => {
+        db.all('SELECT * FROM matches WHERE group_id = ? ORDER BY match_date ASC', groupId, (err, matches) => {
             if (err) {
                 console.error('Error fetching matches:', err.message);
                 return res.status(500).send('Error fetching matches');
@@ -323,66 +322,99 @@ router.get('/group/:groupId', (req, res) => {
                 }
 
                 let matchesHeader = matches.map(match => `
-                    <th class="match-header">
-                        <div class="match-name ${match.match_date > new Date() ? 'future-match' : 'past-match'}">${match.home_team} vs ${match.away_team}</div>
-                        <div class="match-date">${(match.match_date)}</div>
-                    </th>
-                `).join('');
+                <th class="match-header">
+                    <div class="match-name ${match.status === 'FINISHED' ? 'finished-match' : 'unfinished-match'}">${match.home_team} vs ${match.away_team}</div>
+                    <div class="match-date">${match.match_date}</div>
+                    <div class="match-status">${match.status}</div>
+                    <div class="match-winner">${match.winner || 'TBD'}</div>
+                    <div class="match-score">${match.home_score !== null ? match.home_score : '-'} : ${match.away_score !== null ? match.away_score : '-'}</div>
+                </th>
+            `).join('');
+            
+            let participantsRowsPromises = participants.map(participant => {
+                return new Promise((resolve, reject) => {
+                    db.all(`
+                        SELECT m.home_team, m.away_team, m.match_date, m.status, m.winner, p.prediction
+                        FROM matches m
+                        LEFT JOIN predictions p ON m.match_id = p.match_id AND p.participant_id = ?
+                        WHERE m.group_id = ?
+                    `, [participant.id, groupId], (err, predictions) => {
+                        if (err) {
+                            console.error('Error fetching predictions:', err.message);
+                            resolve([]);
+                        } else {
+                            let points = 0;
+                            let predictionsHTML = predictions.map(prediction => {
+                                let correctClass = '';
+                                if (prediction.status === 'FINISHED') {
+                                    if ((prediction.winner === 'HOME_TEAM' && prediction.prediction === '1') ||
+                                        (prediction.winner === 'DRAW' && prediction.prediction === 'X') ||
+                                        (prediction.winner === 'AWAY_TEAM' && prediction.prediction === '2')) {
+                                        correctClass = 'green';
+                                        points++;
+                                    } else {
+                                        correctClass = 'red';
+                                    }
+                                }
+                                return `<td class="${correctClass}">${prediction.prediction || "-"}</td>`;
+                            }).join('');
 
-                let participantsRowsPromises = participants.map(participant => {
-                    return new Promise((resolve, reject) => {
-                        db.all(`
-                            SELECT m.home_team, m.away_team, m.match_date, p.prediction
-                            FROM matches m
-                            LEFT JOIN predictions p ON m.match_id = p.match_id AND p.participant_id = ?
-                            WHERE m.group_id = ?
-                        `, [participant.id, groupId], (err, predictions) => {
-                            if (err) {
-                                console.error('Error fetching predictions:', err.message);
-                                resolve([]);
-                            } else {
-                                resolve({ participant, predictions });
-                            }
-                        });
+                            resolve({ participant, predictionsHTML, points });
+                        }
                     });
                 });
+            });
 
-                Promise.all(participantsRowsPromises).then(participantsData => {
-                    let participantsRowsHTML = participantsData.map(({ participant, predictions }) => {
-                        let allPredictionsSet = predictions.every(prediction => ['1', 'X', '2'].includes(prediction.prediction));
-                        let participantNameClass = allPredictionsSet ? 'participant-name green' : 'participant-name red';
-                        let participantPredictionsHTML = predictions.map(prediction => `
-                            <td>${prediction.prediction || "-"}</td>
-                        `).join('');
-                        return `
-                            <tr>
-                                <td class="${participantNameClass}">${participant.name}</td>
-                                <td>
-                                    <a href="/group/${groupId}/export/${participant.id}" target="_blank" onclick="return confirm('Are you sure you want to export predictions for ${participant.name}?')">
-                                        <button>Export</button>
-                                    </a>
-                                </td>
-                                ${participantPredictionsHTML}
-                            </tr>
-                        `;
-                    }).join('');
+            Promise.all(participantsRowsPromises).then(participantsData => {
+                let participantsRowsHTML = participantsData.map(({ participant, predictionsHTML }) => {
+                    // Parse predictionsHTML into an array of predictions
+                    let predictions = predictionsHTML.split('</td>').slice(0, -1).map(html => {
+                        return html.replace('<td>', '');
+                    });
+            
+                    // Check if all predictions are correct (1, X, or 2)
+                    let allPredictionsCorrect = predictions.every(prediction => ['1', 'X', '2'].includes(prediction.trim()));
+            
+                    // Determine the class based on the correctness of predictions
+                    let participantNameClass = allPredictionsCorrect ? 'participant-name green' : 'participant-name red';
+            
+                    return `
+                        <tr>
+                            <td class="${participantNameClass}">${participant.name}</td>
+                            <td>
+                                <a href="/group/${groupId}/export/${participant.id}" target="_blank" onclick="return confirm('Are you sure you want to export predictions for ${participant.name}?')">
+                                    <button>Export</button>
+                                </a>
+                            </td>
+                            ${predictionsHTML}
+                        </tr>
+                    `;
+                }).join('');
+            
 
-                    let feedbackMessage = message ? `<div class="feedback ${status}">${message.replace(/\+/g, ' ')}</div>` : '';
+                let leaderboard = participantsData.sort((a, b) => b.points - a.points).map(({ participant, points }) => `
+                    <tr>
+                        <td>${participant.name}</td>
+                        <td>${points}</td>
+                    </tr>
+                `).join('');
 
-                    res.send(`
-                        <style>
-                            .match-header { width: 200px; text-align: center; }
-                            .match-name { font-size: 16px; font-weight: bold; pointer-events: none; }
-                            .future-match { background-color: green; }
-                            .past-match { background-color: red; }
-                            .green { background-color: green; }
-                            .red { background-color: red; }
-                            #scroll-container { overflow-x: auto; cursor: grab; }
-                            table { border-collapse: collapse; }
-                            th, td { border: 1px solid black; padding: 8px; min-width: 100px; }
-                            button { pointer-events: auto; }
-                            .feedback { padding: 10px; color: ${status === 'error' ? 'red' : 'green'}; margin-bottom: 10px; }
-                        </style>
+                let feedbackMessage = message ? `<div class="feedback ${status}">${message.replace(/\+/g, ' ')}</div>` : '';
+
+                res.send(`
+                <style>
+                .match-header { width: 200px; text-align: center; }
+                .match-name { font-size: 16px; font-weight: bold; pointer-events: none; }
+                .finished-match { background-color: green; }
+                .unfinished-match { background-color: red; }
+                .green { background-color: lightgreen; }
+                .red { background-color: lightcoral; }
+                #scroll-container { overflow-x: auto; cursor: grab; }
+                table { border-collapse: collapse; }
+                th, td { border: 1px solid black; padding: 8px; min-width: 100px; }
+                button { pointer-events: auto; }
+                .feedback { padding: 10px; color: ${status === 'error' ? 'red' : 'green'}; margin-bottom: 10px; }
+            </style>
                         <h1>Group Details: ${group.name}</h1>
                         <div>Total Participants: ${participants.length}</div>
                         <div>Total Matches: ${matches.length}</div>
@@ -421,6 +453,11 @@ router.get('/group/:groupId', (req, res) => {
                                 slider.scrollLeft = scrollLeft - walk;
                             });
                         </script>
+                        <h2>Leaderboard</h2>
+                        <table>
+                            <tr><th>Participant</th><th>Points</th></tr>
+                            ${leaderboard}
+                        </table>
                         <h2>Add Participant:</h2>
                         <form action="/group/${groupId}/add-participant" method="post">
                             <input type="text" name="participantName" placeholder="Participant Name" required>

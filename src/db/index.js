@@ -70,6 +70,10 @@ db.run(`
             home_team TEXT NOT NULL,
             away_team TEXT NOT NULL,
             match_date TEXT NOT NULL,
+            status TEXT,
+            winner TEXT,
+            home_score INTEGER,
+            away_score INTEGER,
             FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
         )
     `, err => {
